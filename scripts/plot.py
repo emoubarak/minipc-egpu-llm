@@ -15,13 +15,16 @@ SRC = ROOT / "data" / "results.csv"
 OUT = ROOT / "docs" / "throughput.svg"
 
 PANELS = [
-    ("moe-tg", "Qwen3.6-35B-A3B Q4 (22 GB MoE, does not fit in 8 GB VRAM)", "generation, tokens/s"),
-    ("moe-pp", "Same model, reading a 5,780-token chat prompt (2026-10-09)", "prompt processing, tokens/s"),
+    ("moe-tg", "Qwen3.6-35B-A3B at Q4 (20-22 GB MoE, larger than the 8 GB card)",
+     "generation, tokens/s. Three GGUF files of the same architecture: Unsloth UD-Q4_K_M (21.1 GiB), "
+     "the Huihui finetune Q4_K (20.2 GiB), Q4_K_M (May)"),
+    ("moe-pp", "Huihui Q4_K finetune, reading a 5,780-token chat prompt (2026-10-09, MTP n=2)",
+     "prompt processing, tokens/s"),
     ("dense-tg", "Qwen3-8B Q4_K_M (4.9 GB dense, fits in VRAM, 2026-05)", "generation, tokens/s"),
 ]
 
-W = 860
-LABEL_W = 330
+W = 980
+LABEL_W = 430
 BAR_X = LABEL_W + 16
 BAR_MAX_W = W - BAR_X - 120
 ROW_H = 26
@@ -31,9 +34,9 @@ TITLE_H = 46
 
 
 def kind(label):
-    if label.startswith("780M"):
+    if "780M" in label:
         return "igpu"
-    if "+" in label or "Ollama" in label:
+    if "both GPUs" in label or "Ollama" in label:
         return "other"
     return "egpu"
 

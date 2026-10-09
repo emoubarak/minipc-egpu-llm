@@ -16,10 +16,13 @@ any distribution.
 
 OCuLink is plain PCIe on a cable, so there is no Thunderbolt controller in the way. It still is only four lanes,
 and the cable matters: this one started to throw errors at PCIe 4.0 and the link was forced down to 3.0, about
-1.1 GB/s measured host to device. Check yours:
+1.1 GB/s measured host to device. Check what the link can do and what it trained to:
 
 ```bash
-nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv
+nvidia-smi --query-gpu=pcie.link.gen.max,pcie.link.gen.gpumax,pcie.link.width.max --format=csv
+# The current generation drops at idle to save power: read it while the GPU is busy.
+nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv -l 1
+sudo dmesg | grep -i aer      # corrected/uncorrected PCIe errors point at the cable or dock
 ```
 
 ## Drivers
@@ -27,7 +30,10 @@ nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=cs
 ### NVIDIA and CUDA
 
 ```bash
-# Driver from RPM Fusion
+# Enable RPM Fusion (free and nonfree), then install the driver from it
+sudo dnf install -y \
+  https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
+  https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
 sudo dnf install -y akmod-nvidia xorg-x11-drv-nvidia-cuda
 # Toolkit from NVIDIA's own repository (CUDA 13.4 supports GCC 16 and Fedora 44)
 sudo dnf config-manager addrepo --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo
@@ -42,7 +48,7 @@ sudo dnf install -y vulkan-headers vulkan-loader-devel glslc spirv-headers-devel
 ```
 
 Mesa's RADV driver is the one to use on the 780M. ROCm works too (Fedora ships ROCm 7.1 built for `gfx1103`)
-but it generated 30 % slower than Vulkan here: see [results.md](results.md#radeon-780m-vulkan-against-rocm-qwen3-8b-q4_k_m-may).
+but it generated 28 % slower than Vulkan here (11.3 against 15.75 t/s): see [results.md](results.md#radeon-780m-vulkan-against-rocm-qwen3-8b-q4_k_m-may).
 
 ## llama.cpp
 
@@ -59,10 +65,16 @@ cmake --build build-cuda -j"$(nproc)" --target llama-server llama-bench
 ```
 
 Builds move fast and not always forward for a given setup: master `de7fa0a` predicted worse than `abeada3` with
-MTP (acceptance 0.75 → 0.63). Keep a copy of a build that works before pulling:
+MTP (acceptance 0.75 → 0.63). Keep a copy of a build that works before pulling. A plain `cp` is not enough: the
+binaries have an absolute RUNPATH to `build-cuda/bin` and would load the libraries of the next build. Point the
+copy at itself with `patchelf` (`sudo dnf install patchelf`):
 
 ```bash
-cp -r build-cuda/bin ~/llama-builds/cuda-$(git rev-parse --short HEAD)
+mkdir -p ~/llama-builds
+snap=~/llama-builds/cuda-$(git -C ~/llama.cpp rev-parse --short HEAD)
+cp -a ~/llama.cpp/build-cuda/bin "$snap"
+find "$snap" -maxdepth 1 -type f \( -name 'llama-*' -o -name 'lib*.so*' \) -exec patchelf --set-rpath '$ORIGIN' {} \;
+ldd "$snap/llama-server" | grep -E 'ggml|llama'   # every library must resolve inside $snap
 ```
 
 Check the device names of the Vulkan build, `ai-auto` assumes `Vulkan0` = iGPU and `Vulkan1` = eGPU:
@@ -80,7 +92,8 @@ Flags renamed since spring 2026: `--spec-type mtp` → `--spec-type draft-mtp`; 
 ```bash
 curl -LsSf https://hf.co/cli/install.sh | bash      # the `hf` CLI
 hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --local-dir models/qwen3.6-35b-a3b-mtp
-hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF --include "*UD-Q4_K_XL*" "mtp-*" --local-dir models/gemma-4-26b-qat
+hf download unsloth/gemma-4-26B-A4B-it-qat-GGUF gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf mtp-gemma-4-26B-A4B-it.gguf \
+  --local-dir models/gemma-4-26b-qat
 ```
 
 Unsloth's MTP files have the same name as the non-MTP ones, so keep them in their own folder. `ai-auto` reads
@@ -92,23 +105,29 @@ Unsloth's MTP files have the same name as the non-MTP ones, so keep them in thei
 export LLAMA_DIR=~/llama.cpp
 bin/ai-auto info models/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf   # print the commands
 bin/ai-auto serve models/.../model.gguf                                     # run llama-server
-bin/serve-bench -- -m model.gguf -ngl 99 -fa on -ncmoe 33 --spec-type draft-mtp --spec-draft-n-max 2
+bin/serve-bench --server "$LLAMA_DIR/build-cuda/bin/llama-server" \
+  -- -m model.gguf -ngl 99 -fa on -ncmoe 33 --spec-type draft-mtp --spec-draft-n-max 2 -np 1
 ```
 
 ## A chat UI
 
-Any OpenAI-compatible client works with `llama-server`. Open WebUI with rootless Podman:
+Any OpenAI-compatible client works with `llama-server`. Open WebUI with rootless Podman, with llama-server on
+`127.0.0.1:8080`:
 
 ```bash
-podman run -d --name open-webui -p 127.0.0.1:3000:8080 \
+podman run -d --name open-webui \
+  --network pasta:-T,8081:8080 -p 127.0.0.1:3000:8080 \
   -v open-webui:/app/backend/data \
   -e ENABLE_OLLAMA_API=false \
-  -e OPENAI_API_BASE_URL=http://host.containers.internal:8080/v1 \
+  -e OPENAI_API_BASE_URL=http://127.0.0.1:8081/v1 \
   -e OPENAI_API_KEY=none \
   ghcr.io/open-webui/open-webui:main
 ```
 
-Bind to `127.0.0.1` explicitly: rootless Podman forwards IPv4 only.
+`host.containers.internal` does **not** reach a server bound to the host's `127.0.0.1` (Podman 5.8 with pasta:
+connection refused, checked). `-T,8081:8080` makes pasta forward the container's own `127.0.0.1:8081` to the
+host's loopback port 8080 (8081 because Open WebUI itself listens on 8080 inside the container). Publish the UI
+on `127.0.0.1` explicitly.
 
 To keep several models behind one endpoint and load them on demand, see
 [`examples/llama-swap.yaml`](../examples/llama-swap.yaml).

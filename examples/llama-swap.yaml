@@ -5,7 +5,12 @@
 #   - the main chat model on the eGPU (CUDA build), always loaded;
 #   - an embedding model on the iGPU (Vulkan build), loaded next to it and never swapped out;
 #   - other chat models on the iGPU, swapped in when asked for.
-# Adjust paths, -ncmoe and -c to your hardware. Measured numbers for this config: docs/results.md.
+# Adjust paths, -ncmoe and -c to your hardware.
+#
+# The eGPU flags below were measured (docs/results.md, "one model, four ways to run it") with the
+# Huihui-Qwen3.6-35B-A3B-abliterated Q4_K file (20.2 GiB). The Unsloth UD-Q4_K_M file used here is
+# 21.1 GiB and was not run with exactly these flags: if it runs out of VRAM, raise -ncmoe to 34
+# or lower -c. The iGPU and embedding entries were not measured as written.
 
 healthCheckTimeout: 300
 startPort: 18100

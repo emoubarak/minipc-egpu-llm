@@ -6,9 +6,9 @@ within a session, not across sessions**. The raw values are in [`data/results.cs
 
 | Session | Dates | llama.cpp | Software | eGPU link |
 |---|---|---|---|---|
-| May | 2026-05-05 to 05-09 | b9013 (`e48034dfc`), MTP from PR #22673 (`5d5f1b46e`) | kernel 6.19, NVIDIA 595.71, Mesa 26.0.5, CUDA 13.2 | PCIe 4.0 x4 |
-| Oct, Gen4 | 2026-10-06 to 10-07 | master `abeada3` (CUDA), b11433 `50569eb87` (Vulkan) | kernel 7.2, NVIDIA 615.71, Mesa 26.2, CUDA 13.4.92 | PCIe 4.0 x4 |
-| Oct, Gen3 | 2026-10-09 | master `abeada3` and `de7fa0a` | same | **PCIe 3.0 x4** (cable errors at 4.0, ~1.1 GB/s host-to-device measured with `cudaMemcpy`) |
+| May | 2026-05-05 to 05-09 | build 9013 (commit `e48034dfc`), MTP from PR #22673 (commit `5d5f1b46e`) | kernel 6.19, NVIDIA 595.71, Mesa 26.0.5, CUDA 13.2 | PCIe 4.0 x4 |
+| Oct, Gen4 | 2026-10-06 to 10-07 | master `abeada3` (CUDA), build 11433 `50569eb87` (Vulkan) | kernel 7.2, NVIDIA 615.71, Mesa 26.2, CUDA 13.4.92 | PCIe 4.0 x4 |
+| Oct, Gen3 | 2026-10-09 | master `abeada3` and `de7fa0a`, build 11433 `50569eb87` (Vulkan) | same | **PCIe 3.0 x4** (cable errors at 4.0, ~1.1 GB/s host-to-device measured with `cudaMemcpy`) |
 
 Method: `llama-bench -p 512 -n 200 -r 3` where it says llama-bench. Everything with MTP or another kind of
 speculative decoding comes from `llama-server` (llama-bench cannot run it), with the prompt
@@ -33,14 +33,16 @@ Common flags: `-ngl 99 -fa 1 -ctk q8_0 -ctv f16 -ub 512`. Server runs: `-c 2048 
 | llama-server, `-ncmoe 32`, MTP n=2 (3 runs) | | 51.68-57.34 | 68.9 % |
 | llama-server, `-ncmoe 33`, MTP n=3 (4 runs) | | 54.22-54.49 | 59.6 % |
 | llama-server, `-ncmoe 30`, MTP n=2 | | OOM (draft context needs 98 MiB more) | |
-| Vulkan b11433, llama-bench, `-ncmoe 30` | 217.42 | 33.76 | |
+| Vulkan build 11433, llama-bench, `-ncmoe 30` | 217.42 | 33.76 | |
 
-`-ncmoe` sweep, Vulkan b11433 (tg200): 28 OOM, 29 33.76, **30 33.76**, 31 33.20, 32 31.01, 33 31.97, 34 31.20,
+`-ncmoe` sweep, Vulkan build 11433 (tg200): 28 OOM, 29 33.76, **30 33.76**, 31 33.20, 32 31.01, 33 31.97, 34 31.20,
 36 29.77, 40 27.31.
 
 ### Oct, Gen3 link: one model, four ways to run it
 
-`Huihui-Qwen3.6-35B-A3B-abliterated` Q4_K (a finetune with the same architecture and MTP head), MTP n=2,
+`Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q4_K.gguf` (20.2 GiB, from
+[huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF):
+an abliterated finetune with the same architecture and MTP head), MTP n=2,
 `-ctk q8_0 -ctv q8_0`, `--jinja`, thinking off. Three workloads: the completion prompt above, the same text as a
 short chat, and a long chat (5,780-token prompt).
 
@@ -51,16 +53,25 @@ short chat, and a long chat (5,780-token prompt).
 |---|---:|---:|---:|
 | eGPU, CUDA | 41.5-43.2 | 31-37 | 155-158 / 38-43 |
 | iGPU, Vulkan `abeada3` | 25.6-27.9 | 20-21 | **390-394** / 28.5-29.7 |
-| iGPU, Vulkan b11433 | 23.6-25 | 16-19 | 373-375 / 22-23.5 |
+| iGPU, Vulkan build 11433 | 23.6-25 | 16-19 | 373-375 / 22-23.5 |
 | Both GPUs, experts on the iGPU (`-ot ffn_.*_exps=Vulkan0`) | 20-21 | 16-17 | 175-310 / 19.6 |
 | Two servers at once: the eGPU one | 28-29 | 21-26 | 155 / 24-38 |
 | Two servers at once: the iGPU one | 27-29.5 | 20.5-21 | 379-397 / 25-28 |
 
-**The Gen4 numbers did not come back.** On 2026-10-09, `abeada3` with the exact 2026-10-06 flags measured
-41 t/s with MTP (59 before) and 35.5 without (46 before), at the same acceptance. The only known change is the
-link dropping to PCIe 3.0. That explains the slower prompt processing (experts copied to the GPU for big
-batches); it is **not proven** for generation, where small batches should not copy experts. To be re-measured
-with a new cable.
+### Oct, Gen3 link: the Gen4 numbers did not come back
+
+Same Unsloth UD-Q4_K_M file and the 2026-10-06 replay conditions (`-ngl 99 -fa 1 -ctk q8_0 -ctv f16 -ub 512
+-c 4096 -np 1`, completion prompt, tg200), measured again on 2026-10-09:
+
+| Build | Config | 2026-10-06 (Gen4) | 2026-10-09 (Gen3) | Acceptance |
+|---|---|---:|---:|---:|
+| `abeada3` | `-ncmoe 33`, MTP n=2 | 58.78-59.37 | **41.1** | 0.748 both days |
+| `abeada3` | `-ncmoe 30`, no MTP | 45.55-45.98 | **35.5** | |
+| `de7fa0a` | `-ncmoe 33`, MTP n=2 | | 37.8 | 0.634 |
+
+The only known change between the two days is the link dropping to PCIe 3.0 on 2026-10-08. That explains
+slower prompt processing (experts copied to the GPU for big batches); it is **not proven** for generation, where
+small batches should not copy experts. To be re-measured with a new cable.
 
 ### Oct, Gen3 link: where to put the experts (master `de7fa0a`)
 
@@ -100,7 +111,7 @@ MoE expert GPU cache (`--moe-cache-mib`, PR #29887, `de7fa0a`): `-ncmoe 30` with
 `-ncmoe 32` + 1000 MiB cache 1-4.5 t/s (53 % hit rate); `-cmoe` + 4000 MiB 7.9 t/s; `-cmoe` + 4500 MiB 8.2 t/s
 (81 % hit rate); `-ncmoe 33` + 2000 MiB OOM. Every miss crosses the slow link.
 
-### May: Vulkan b9013 and the MTP pull request
+### May: Vulkan build 9013 and the MTP pull request
 
 `-ngl 99 -fa 1 -ctk q8_0 -r 3`, `Qwen3.6-35B-A3B` Q4_K_M (22.28 GiB).
 
@@ -112,7 +123,7 @@ MoE expert GPU cache (`--moe-cache-mib`, PR #29887, `de7fa0a`): `-ncmoe 30` with
 | Both GPUs, `-ts 4/1` | 310.8 | 7.3 |
 | Ollama (CUDA), same model | 71.7 | 11.2 |
 
-MTP, PR #22673 build `5d5f1b46e`, `localweights/Qwen3.6-35B-A3B-MTP-Q4_K_M` (20.22 GiB), llama-server tg150:
+MTP, PR #22673 build `5d5f1b46e`, `localweights/Qwen3.6-35B-A3B-MTP-Q4_K_M-GGUF` (20.22 GiB), llama-server tg150:
 
 | Device | Config | tg | Acceptance |
 |---|---|---:|---:|
@@ -127,7 +138,7 @@ MTP, PR #22673 build `5d5f1b46e`, `localweights/Qwen3.6-35B-A3B-MTP-Q4_K_M` (20.
 ## Gemma 4 26B-A4B (MoE, 128 experts)
 
 Oct, Gen4, CUDA `abeada3`, `unsloth/gemma-4-26B-A4B-it-qat` UD-Q4_K_XL with the separate MTP drafter
-`mtp-gemma-4-26b-a4b-it.gguf` placed on CUDA0 (`-devd CUDA0 -otd token_embd.weight=CUDA0`), `-ncmoe 17
+`mtp-gemma-4-26B-A4B-it.gguf` placed on CUDA0 (`-devd CUDA0 -otd token_embd.weight=CUDA0`), `-ncmoe 17
 -ctk q8_0 -ctv f16 -ub 512 -c 4096`:
 
 | Config | tg200 | Acceptance |
@@ -137,7 +148,7 @@ Oct, Gen4, CUDA `abeada3`, `unsloth/gemma-4-26B-A4B-it-qat` UD-Q4_K_XL with the 
 | llama-server, MTP n=2 | **54.24** | 55.6 % |
 | llama-server, MTP n=3 | 46.64 | 40.2 % |
 
-May, b9013, UD-Q4_K_M (15.78 GiB):
+May, build 9013, UD-Q4_K_M (15.78 GiB):
 
 | Config | pp512 | tg200 |
 |---|---:|---:|
@@ -147,7 +158,7 @@ May, b9013, UD-Q4_K_M (15.78 GiB):
 
 ## Dense models
 
-May, b9013, `-ngl 99 -fa 1 -ctk q8_0`.
+May, build 9013, `-ngl 99 -fa 1 -ctk q8_0`.
 
 | Model | Device | pp512 | tg200 |
 |---|---|---:|---:|
