@@ -1,0 +1,64 @@
+# llama-swap (https://github.com/mostlygeek/llama-swap): one OpenAI-compatible endpoint in front of
+# several llama-server instances, started on demand.
+#
+# Layout used on the machine described in this repo:
+#   - the main chat model on the eGPU (CUDA build), always loaded;
+#   - an embedding model on the iGPU (Vulkan build), loaded next to it and never swapped out;
+#   - other chat models on the iGPU, swapped in when asked for.
+# Adjust paths, -ncmoe and -c to your hardware. Measured numbers for this config: docs/results.md.
+
+healthCheckTimeout: 300
+startPort: 18100
+
+macros:
+  models: /path/to/models
+  cuda: /path/to/llama.cpp/build-cuda/bin/llama-server --port ${PORT} --host 127.0.0.1
+  vulkan: /path/to/llama.cpp/build/bin/llama-server --port ${PORT} --host 127.0.0.1
+  igpu: -dev Vulkan0 -ngl 99 -fa on -ctk q8_0 -ub 1024 -np 1 --jinja
+
+models:
+  qwen3.6-35b:
+    name: "Qwen3.6 35B-A3B MTP (eGPU)"
+    # Prompts under 1024 tokens: compute the CPU-side experts on the CPU instead of copying them
+    # over the eGPU link. Short prompts went from 10-16 s to 2.4-6 s on a PCIe 3.0 x4 link.
+    env:
+      - GGML_OP_OFFLOAD_MIN_BATCH=1024
+    cmd: >-
+      ${cuda} -m ${models}/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+      -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -ub 2048 -b 2048 -ncmoe 33 -np 1 -c 65536
+      --spec-type draft-mtp --spec-draft-n-max 2 --jinja
+      --chat-template-kwargs '{"enable_thinking":false}'
+
+  qwen3.6-35b-igpu:
+    name: "Qwen3.6 35B-A3B MTP (iGPU, long prompts)"
+    ttl: 900
+    cmd: >-
+      ${vulkan} ${igpu} -ctv q8_0 -m ${models}/qwen3.6-35b-a3b-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+      -c 32768 --spec-type draft-mtp --spec-draft-n-max 2
+
+  embeddings:
+    name: "Embedding model (iGPU)"
+    cmd: >-
+      ${vulkan} -dev Vulkan0 -ngl 99 -m ${models}/embeddinggemma-2-Q8_0.gguf
+      --embedding -c 8192 -ub 8192 -b 8192 -np 1
+
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        chat:          # one chat model at a time
+          swap: true
+          exclusive: true
+          members: [qwen3.6-35b, qwen3.6-35b-igpu]
+        embeddings:    # stays loaded next to the chat model
+          persistent: true
+          swap: false
+          exclusive: false
+          members: [embeddings]
+
+hooks:
+  on_startup:
+    preload:
+      - qwen3.6-35b
+      - embeddings

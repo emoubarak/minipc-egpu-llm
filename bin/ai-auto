@@ -191,8 +191,8 @@ find_mtp_draft() {
 # ── -ncmoe estimate ─────────────────────────────────────────────────────────────
 # Each MoE layer kept on the GPU costs n_experts × 3 matrices × embed × expert_ff × ~4.5 bits.
 # 56 % of free VRAM goes to experts, the rest to attention, KV cache and compute buffers.
-# Calibrated so that an idle RTX 3060 Ti 8 GB (~7.8 GB free) gives 30 for Qwen3.6-35B-A3B Q4,
-# the lowest value that loaded there. Other cards and models: sweep around it.
+# Calibrated so that an idle RTX 3060 Ti 8 GB (~7.8 GB free) gives 30 for Qwen3.6-35B-A3B Q4_K_M,
+# which loaded with every build tested (29 also did with some). Other cards and models: sweep around it.
 compute_ncmoe() {
     python3 - "$@" <<'PYEOF'
 import math, sys
