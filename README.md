@@ -26,8 +26,8 @@ ones that did not, and two small tools to reproduce them.
 | Gemma 4 26B-A4B QAT UD-Q4_K_XL | eGPU, CUDA, `-ncmoe 17`, MTP drafter n=2 | 54.2 t/s | 2026-10-06 |
 | Qwen3-8B Q4_K_M (dense, fits in VRAM) | eGPU, Vulkan | 64.3 t/s | 2026-05, build 9013 |
 
-Every measurement, with build hashes, exact flags and ranges: [docs/results.md](docs/results.md). The main
-ones as a CSV (the source of the chart): [data/results.csv](data/results.csv).
+The main measurements, with build hashes, exact flags and ranges: [docs/results.md](docs/results.md). The
+headline ones as a CSV (the source of the chart): [data/results.csv](data/results.csv).
 
 **Read the dates.** After the eGPU cable started failing at PCIe 4.0 and the link dropped to 3.0 x4 (2026-10-08),
 the same build, model and flags gave 41 t/s instead of 59 with MTP, and 35.5 instead of 46 without. The 59 t/s
@@ -44,8 +44,8 @@ figures are real but not what this box does today; the chart shows both.
    every recent run. The llama.cpp build changed acceptance from 0.75 to 0.63 between two commits a few days
    apart: keep a build that works.
 3. **The eGPU link is part of the model.** Prompt processing copies experts over PCIe x4. On Gen3 the iGPU read
-   long prompts 2.5x faster than the eGPU. `GGML_OP_OFFLOAD_MIN_BATCH=1024` cut the time to read 150-700-token
-   prompts from 10-16 s to 2.4-6 s (2026-10-08, Gen3 link, Huihui Q4_K). The new MoE expert GPU cache (`--moe-cache-mib`) made generation 4x slower or worse.
+   a 5,780-token prompt 2.5x faster than the eGPU. The new MoE expert GPU cache (`--moe-cache-mib`) made
+   generation 4x slower or worse.
 4. **The 780M is a real second GPU** with Vulkan (not ROCm), `-ctv q8_0` for big models, and
    `RADV_PERFTEST=nogttspill` only when the model fits in the UMA carve-out.
 5. **Splitting one model across both GPUs was slower** in every case but one. Two separate servers, one per GPU,

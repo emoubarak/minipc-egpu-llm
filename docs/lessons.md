@@ -11,7 +11,8 @@ computes them. That gave 45.6 t/s without speculation and 59 t/s with MTP on the
 - **Sweep `-ncmoe`, do not trust a formula.** On this card, UD-Q4_K_M loaded from 29 or 30 depending on the
   build, UD-IQ4_XS from 26 to 28. Lower is usually faster, until the compute buffers no longer fit.
 - **MTP needs headroom.** At `-ncmoe 30` the MTP draft context failed to allocate 98 MiB more (2026-10-06); the
-  best MTP point was 33, three more layers of experts on the CPU (~1.5 GB of VRAM freed at ~500 MB per layer).
+  best MTP point was 33, three more layers of experts on the CPU (~1.5 GB of VRAM freed: one layer of experts is
+  498 MB in this file, read from its tensor table by `ai-auto`).
 - **Try `-cmoe` too** (every expert on the CPU). On the slower Gen3 link it beat `-ncmoe 30` (37.0 against 33.0
   t/s) while using 2.6 GB of VRAM instead of 7.4, which leaves room for context. It reads long prompts ~19 %
   slower.
@@ -43,12 +44,12 @@ With experts in system RAM, large batches (prompt processing) copy expert weight
 At PCIe 3.0 x4 (~1.1 GB/s measured) this hurts:
 
 - The **iGPU read a 5,780-token prompt 2.5x faster** than the eGPU (390-394 against 155-158 t/s, 2026-10-09),
-  because it shares the RAM and copies nothing. Longer prompts narrow the gap: the eGPU read a 37k-token prompt
-  at 280-288 t/s (2026-10-08), as bigger batches spread the cost of each copy.
-- `GGML_OP_OFFLOAD_MIN_BATCH=1024` keeps batches under 1024 tokens on the CPU instead of copying experts. Prompts
-  of 150-700 tokens went from 10-16 s to 2.4-6 s to read; a 37k-token prompt was unchanged (280 → 288 t/s).
-  Measured 2026-10-08 on the Gen3 link, Huihui Q4_K, CUDA `abeada3`, the config in
-  [`examples/llama-swap.yaml`](../examples/llama-swap.yaml).
+  because it shares the RAM and copies nothing.
+- `GGML_OP_OFFLOAD_MIN_BATCH=1024` tells llama.cpp to compute batches under 1024 tokens where the weights are
+  (the CPU, for the experts kept in RAM) instead of copying them to the GPU. It is part of the eGPU config that
+  produced the Gen3 numbers here and of [`examples/llama-swap.yaml`](../examples/llama-swap.yaml). Its effect on
+  short prompts was tried on 2026-10-08 but the runs were not kept, so no number is given here: measure it on
+  your link with `bin/serve-bench --mode chat` and a few hundred tokens of prompt, with and without it.
 - The MoE expert GPU cache (`--moe-cache-mib`) was a **net loss**: every miss crosses the link, and 8 GB only
   holds a small share of the experts. 35 t/s without it, 1-8 t/s with it (2026-10-09, `de7fa0a`).
 - Generation also fell after the link dropped from Gen4 to Gen3 (59 → 41 t/s with MTP, 46 → 35.5 without;
@@ -66,11 +67,12 @@ The iGPU has no 8 GB wall: it uses the 16 GB carve-out plus GTT from system RAM.
   (372 against 273), and on HIP, flash attention only takes the fast path when K and V caches have the same type.
 - **`-ctv q8_0` for models over ~10 GB**: Gemma 4 26B went from 9.9 to 19.0 t/s with a q8_0 V cache and without
   `nogttspill` (both changed together, May). Memory bandwidth is the limit (dual-channel DDR5 shared with the
-  CPU: ~89.6 GB/s in theory at DDR5-5600, the platform maximum; the module speed was not recorded), so a smaller
-  V cache helps. On the eGPU it did not (-2 % on Qwen3-8B with Vulkan, May).
+  CPU), so a smaller V cache helps. On the eGPU it did not (2334 → 2280 t/s prompt, 64.6 → 63.1 t/s generation
+  on Qwen3-8B with Vulkan, May).
 - **`RADV_PERFTEST=nogttspill` only when the model fits in the carve-out.** It keeps allocations in UMA; with a
   model larger than UMA it forces a slow overflow (28.0 → 20.5 t/s on the 22 GB model).
-- `-ub 1024` for prompt processing (+15 % in May; the model of that run was not recorded).
+- `-ub 1024` for prompt processing. It is what `ai-auto` uses on the iGPU and what the iGPU numbers here were
+  measured with; the run comparing it with smaller values was not kept.
 - Recent Vulkan builds matter here: `abeada3` was 10-25 % faster than build 11433 on the 780M (2026-10-09).
 
 ## 5. Splitting one model across both GPUs rarely pays
@@ -95,8 +97,8 @@ to the main one, which is what [`examples/llama-swap.yaml`](../examples/llama-sw
   prompt). It shines when the whole model fits in VRAM.
 - **TurboQuant KV cache** (fork, not upstream): same speed as q8_0/f16 within noise, and the standard cache
   already reached 128k context on this hybrid-attention model.
-- **A small separate draft model** on the other GPU: about 3x slower than no speculation, from cross-device
-  synchronisation (spring 2026; the individual numbers were not kept).
+- **A small separate draft model** on the other GPU: slower than no speculation in spring 2026, from cross-device
+  synchronisation (the runs were not kept).
 - **Ollama** (spring 2026): about 3x slower than llama.cpp in generation on the MoE model (11.2 against 33.3 t/s),
   no MTP on CUDA, no `-ncmoe`.
 - **The NPU** (XDNA 1): no LLM runtime on Linux, see [npu.md](npu.md).

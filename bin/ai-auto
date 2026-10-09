@@ -207,7 +207,7 @@ def main(path):
 
 try:
     main(sys.argv[1])
-except (OSError, ValueError, struct.error, OverflowError, MemoryError) as e:
+except (OSError, ValueError, struct.error, OverflowError, MemoryError, RecursionError) as e:
     print(f"  \033[0;31m✗\033[0m could not read GGUF metadata: {sys.argv[1]}: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF

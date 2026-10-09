@@ -24,8 +24,8 @@ macros:
 models:
   qwen3.6-35b:
     name: "Qwen3.6 35B-A3B MTP (eGPU)"
-    # Prompts under 1024 tokens: compute the CPU-side experts on the CPU instead of copying them
-    # over the eGPU link. Short prompts went from 10-16 s to 2.4-6 s on a PCIe 3.0 x4 link.
+    # Batches under 1024 tokens: compute the experts kept in RAM on the CPU instead of copying
+    # them over the eGPU link (helps short prompts on a slow link; measure it on yours).
     env:
       - GGML_OP_OFFLOAD_MIN_BATCH=1024
     cmd: >-

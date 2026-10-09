@@ -19,11 +19,14 @@ server's timings. [`bin/serve-bench`](../bin/serve-bench) reproduces that method
 ## Qwen3.6-35B-A3B (MoE, 256 experts, 8 active, ~21-22 GB at Q4)
 
 The model is 2.5x larger than the card's VRAM. On the eGPU, attention and some expert layers live in VRAM and
-the remaining experts stay in system RAM (`-ncmoe N` = number of layers whose experts stay on the CPU).
+the remaining experts stay in system RAM (`-ncmoe N` = number of layers whose experts stay on the CPU). In the
+Unsloth UD-Q4_K_M file, the largest layer of experts is 498 MB (read from the GGUF tensor table, as
+`bin/ai-auto` does).
 
 ### Oct, Gen4 link: CUDA master `abeada3`, Unsloth `Qwen3.6-35B-A3B-MTP` UD-Q4_K_M (21.1 GiB)
 
-Common flags: `-ngl 99 -fa 1 -ctk q8_0 -ctv f16 -ub 512`. Server runs: `-c 2048 -np 1`, tg200.
+Common flags: `-ngl 99 -fa 1 -ctk q8_0 -ctv f16 -ub 512`. Server runs: `-c 2048 -np 1`, tg200, except the
+2026-10-07 replays (45.55 and 59.37), which used `-c 4096 -np 1`.
 
 | Config | pp512 | tg | MTP acceptance |
 |---|---:|---:|---:|
@@ -37,6 +40,9 @@ Common flags: `-ngl 99 -fa 1 -ctk q8_0 -ctv f16 -ub 512`. Server runs: `-c 2048 
 
 `-ncmoe` sweep, Vulkan build 11433 (tg200): 28 OOM, 29 33.76, **30 33.76**, 31 33.20, 32 31.01, 33 31.97, 34 31.20,
 36 29.77, 40 27.31.
+
+Same sweep with Unsloth UD-IQ4_XS (16.95 GiB): 24 fails to load, 25 fails to create the context, **26 33.70**
+(pp512 300.60), 27 32.57, 28 32.77, 29 31.90, 30 31.63, 32 30.65.
 
 ### Oct, Gen3 link: one model, four ways to run it
 
@@ -106,6 +112,7 @@ DFlash drafter `z-lab/Qwen3.6-35B-A3B-DFlash` converted to GGUF bf16 (772 MB), `
 | MTP n=2, `-ncmoe 33` | 37.8 / 37.8 / 38.0 | 0.63 | 6.7 GB |
 | DFlash n=4, `-cmoe` | 36.1 / 36.6 / 37.0 | 0.40 | 4.7 GB |
 | DFlash n=6, `-cmoe` | 22.4 / 22.7 / 22.3 | 0.28 | 4.9 GB |
+| DFlash n=15 (full block), `-cmoe`, chat-format prompt | 13 to 17 | 0.12-0.26 | 5.4 GB |
 
 MoE expert GPU cache (`--moe-cache-mib`, PR #29887, `de7fa0a`): `-ncmoe 30` without cache 35.0 t/s;
 `-ncmoe 32` + 1000 MiB cache 1-4.5 t/s (53 % hit rate); `-cmoe` + 4000 MiB 7.9 t/s; `-cmoe` + 4500 MiB 8.2 t/s
@@ -172,6 +179,13 @@ May, build 9013, `-ngl 99 -fa 1 -ctk q8_0`.
 
 The ExLlamaV2 row uses a different model and is only a framework comparison. ExLlamaV2 has since been archived
 in favour of ExLlamaV3.
+
+### Quantised V cache on the eGPU (Qwen3-8B Q4_K_M, Vulkan, 2026-05-05)
+
+| Config | pp512 | tg200 |
+|---|---:|---:|
+| `-ctk q8_0` (V cache f16) | 2334 | 64.6 |
+| `-ctk q8_0 -ctv q8_0` | 2280 | 63.1 |
 
 ### Radeon 780M: Vulkan against ROCm (Qwen3-8B Q4_K_M, May)
 

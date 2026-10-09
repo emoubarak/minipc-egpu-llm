@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write a minimal GGUF header with chosen metadata, for the ai-auto tests.
 
-    make_gguf.py OUT "key|type|value" ...      type: str, u32, f32, bool
+    make_gguf.py OUT "key|type|value" ...      type: str, u32, f32, bool, nested (value = depth)
 
 No tensors are written: ai-auto only reads the header.
 """
@@ -26,6 +26,9 @@ def main():
         body += gguf_str(key)
         if typ == "str":
             body += struct.pack("<I", 8) + gguf_str(value)
+        elif typ == "nested":  # array of array of ... of an empty u32 array, `value` levels deep
+            depth = int(value)
+            body += struct.pack("<I", 9) + struct.pack("<IQ", 9, 1) * (depth - 1) + struct.pack("<IQ", 4, 0)
         else:
             code, fmt = TYPES[typ]
             v = {"u32": int, "f32": float, "bool": lambda x: x == "true"}[typ](value)

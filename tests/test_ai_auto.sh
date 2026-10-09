@@ -84,7 +84,16 @@ fi
 out=$(AI_NCMOE='1+$(touch pwned_env)' AI_GPU=igpu "$AI" info "$AI_MODELS_DIR/moe.gguf" 2>&1); rc=$?
 if (( rc != 0 )) && [[ ! -e "$WORK/pwned_env" ]]; then pass "non-numeric AI_NCMOE rejected"; else fail "AI_NCMOE: rc=$rc"; fi
 
-# 6. Drafters are listed as such.
+# 6. Deeply nested arrays: a clean error, not a Python traceback.
+python3 -I "$MK" "$WORK/deep.gguf" "general.architecture|str|x" "x.junk|nested|5000"
+out=$("$AI" info "$WORK/deep.gguf" 2>&1); rc=$?
+if (( rc != 0 )) && ! grep -q Traceback <<<"$out" && grep -q 'could not read GGUF metadata' <<<"$out"; then
+    pass "deeply nested arrays: clean error"
+else
+    fail "deeply nested arrays: rc=$rc"; echo "$out" | tail -3
+fi
+
+# 7. Drafters are listed as such.
 python3 -I "$MK" "$AI_MODELS_DIR/drafter.gguf" "general.architecture|str|dflash" "dflash.block_count|u32|6"
 if "$AI" list 2>/dev/null | grep -E 'drafter\.gguf' | grep -q ' draft '; then pass "drafter listed as draft"; else fail "drafter in list"; fi
 
