@@ -14,7 +14,9 @@ the server's own `timings` object.
 
 Options:
     --server PATH       llama-server binary (default: $LLAMA_SERVER, else
-                        $LLAMA_DIR/build/bin/llama-server, else llama-server on PATH)
+                        $LLAMA_DIR/build/bin/llama-server, else llama-server on PATH).
+                        The default is the Vulkan build: pass the CUDA one explicitly,
+                        e.g. --server "$LLAMA_DIR/build-cuda/bin/llama-server".
     --mode MODE         completion (default, /completion) or chat (/v1/chat/completions)
     --prompt TEXT       prompt text (default: "Write a short poem about GPU programming.")
     --prompt-file PATH  read the prompt from a file (for long-prompt tests)
@@ -145,6 +147,8 @@ def main():
         print(__doc__)
         return
 
+    if opts.runs < 1 or opts.warmup < 0 or opts.n_predict < 1:
+        sys.exit("serve-bench: --runs and --n-predict must be at least 1, --warmup at least 0")
     for flag in ("--port", "--host", "--log-file"):
         if flag in server_args:
             sys.exit(f"serve-bench: do not pass {flag}, serve-bench sets it")
@@ -153,11 +157,12 @@ def main():
     server = find_server(opts.server)
     port = free_port()
     log_fd, log_path = tempfile.mkstemp(prefix=f"serve-bench-{port}-", suffix=".log")
-    os.close(log_fd)
-    cmd = [server, *server_args, "--host", "127.0.0.1", "--port", str(port), "--log-file", log_path]
+    cmd = [server, *server_args, "--host", "127.0.0.1", "--port", str(port)]
     print("server :", " ".join(cmd), file=sys.stderr)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # llama-server logs to stderr: keep all of it, load errors included, in the log file
+    proc = subprocess.Popen(cmd, stdout=log_fd, stderr=subprocess.STDOUT)
+    os.close(log_fd)
     base = f"http://127.0.0.1:{port}"
     results = []
     try:

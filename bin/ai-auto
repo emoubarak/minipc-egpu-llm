@@ -100,69 +100,145 @@ igpu_capacity_mb() {
 }
 
 # ── GGUF metadata ───────────────────────────────────────────────────────────────
-# Prints KEY=VALUE lines for the keys ai-auto needs.
+# Prints KEY=VALUE lines. Everything here comes from the file, which may not be trusted:
+# numeric keys are passed on only as plain integers, the architecture only as a short
+# identifier, and nothing else is printed. The shell side checks every value again.
 parse_gguf() {
     local path="$1"
-    [[ -f "$path" ]] || { echo "not found: $path" >&2; return 1; }
-    python3 - "$path" <<'PYEOF'
-import os, struct, sys
+    [[ -f "$path" ]] || { echo -e "  ${RED}✗${NC} model not found: $path" >&2; return 1; }
+    python3 -I - "$path" <<'PYEOF'
+import math, os, re, struct, sys
 
 SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 FMTS = {0: 'B', 1: 'b', 2: 'H', 3: 'h', 4: 'I', 5: 'i', 6: 'f', 7: '?', 10: 'Q', 11: 'q', 12: 'd'}
-WANT = {'general.architecture', 'block_count', 'expert_count', 'expert_used_count',
-        'embedding_length', 'expert_feed_forward_length', 'context_length', 'head_count',
-        'head_count_kv', 'nextn_predict_layers'}
+NUMERIC = {'block_count', 'expert_count', 'expert_used_count', 'embedding_length',
+           'expert_feed_forward_length', 'context_length', 'head_count', 'head_count_kv',
+           'nextn_predict_layers'}
+KEY_OK = re.compile(r'[A-Za-z0-9_.-]{1,128}')
+ARCH_OK = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+EXPERTS = re.compile(r'blk\.(\d+)\.ffn_[a-z_]*_exps\.weight')
+MAX_STR = 64 << 20
+
 
 def rstr(f):
     n = struct.unpack('<Q', f.read(8))[0]
+    if n > MAX_STR:
+        raise ValueError('string too long')
     return f.read(n).decode('utf-8', errors='replace')
+
 
 def skip(f, t):
     if t == 8:
         f.seek(struct.unpack('<Q', f.read(8))[0], 1)
     elif t == 9:
         at, ct = struct.unpack('<IQ', f.read(12))
-        for _ in range(ct):
-            skip(f, at)
+        if at in SIZES:
+            f.seek(SIZES[at] * ct, 1)
+        else:
+            for _ in range(ct):
+                skip(f, at)
     elif t in SIZES:
         f.seek(SIZES[t], 1)
+    else:
+        raise ValueError(f'unknown value type {t}')
+
 
 def rval(f, t):
     if t == 8:
         return rstr(f)
-    if t == 9:
-        at, ct = struct.unpack('<IQ', f.read(12))
-        for _ in range(ct):
-            skip(f, at)
-        return None
     if t in SIZES:
         return struct.unpack('<' + FMTS[t], f.read(SIZES[t]))[0]
+    skip(f, t)
+    return None
 
-path = sys.argv[1]
-with open(path, 'rb') as f:
-    if f.read(4) != b'GGUF':
-        sys.exit("not a GGUF file: " + path)
-    f.read(4)  # version
-    _n_tensors, n_kv = struct.unpack('<QQ', f.read(16))
-    meta = {}
-    for _ in range(n_kv):
-        k = rstr(f)
-        t = struct.unpack('<I', f.read(4))[0]
-        v = rval(f, t)
-        if v is not None and (k in WANT or k.split('.')[-1] in WANT):
-            meta[k] = v
 
-print(f"file_size_gb={os.path.getsize(path) / 1024**3:.2f}")
-for k, v in meta.items():
-    print(f"{k}={v}")
+def main(path):
+    size = os.path.getsize(path)
+    with open(path, 'rb') as f:
+        if f.read(4) != b'GGUF':
+            raise ValueError('not a GGUF file')
+        f.read(4)  # version
+        n_tensors, n_kv = struct.unpack('<QQ', f.read(16))
+        meta, alignment = {}, 32
+        for _ in range(n_kv):
+            k = rstr(f)
+            v = rval(f, struct.unpack('<I', f.read(4))[0])
+            if k == 'general.alignment' and type(v) is int and 0 < v <= 4096:
+                alignment = v
+            elif k == 'general.architecture':
+                # free text in the file: only a plain identifier is passed on
+                if isinstance(v, str) and ARCH_OK.fullmatch(v):
+                    meta[k] = v
+            elif k.split('.')[-1] in NUMERIC and KEY_OK.fullmatch(k):
+                # numbers only (bool, strings and arrays are dropped), as plain integers
+                if type(v) in (int, float) and math.isfinite(v) and 0 <= v < 1 << 40:
+                    meta[k] = int(v)
+        tensors = []
+        for _ in range(n_tensors):
+            name = rstr(f)
+            nd = struct.unpack('<I', f.read(4))[0]
+            if nd > 8:
+                raise ValueError('bad tensor rank')
+            dims = struct.unpack(f'<{nd}Q', f.read(8 * nd))
+            f.read(4)  # ggml type
+            tensors.append((struct.unpack('<Q', f.read(8))[0], name, math.prod(dims)))
+        data_start = -(-f.tell() // alignment) * alignment
+
+    # Tensor sizes from consecutive offsets: no table of quantisation block sizes needed.
+    tensors.sort()
+    per_layer, total_bytes, total_elems = {}, 0, 0
+    for i, (off, name, n) in enumerate(tensors):
+        end = tensors[i + 1][0] if i + 1 < len(tensors) else size - data_start
+        nbytes = max(0, end - off)
+        total_bytes += nbytes
+        total_elems += n
+        m = EXPERTS.fullmatch(name)
+        if m:
+            per_layer[int(m.group(1))] = per_layer.get(int(m.group(1)), 0) + nbytes
+
+    print(f"file_size_gb={size / 1024**3:.2f}")
+    if per_layer:
+        print(f"expert_layer_mb={max(per_layer.values()) / 2**20:.0f}")
+    if total_elems:
+        print(f"bits_per_weight={total_bytes * 8 / total_elems:.2f}")
+    for k, v in meta.items():
+        print(f"{k}={v}")
+
+
+try:
+    main(sys.argv[1])
+except (OSError, ValueError, struct.error, OverflowError, MemoryError) as e:
+    print(f"  \033[0;31m✗\033[0m could not read GGUF metadata: {sys.argv[1]}: {e}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
 }
 
-meta_get() {  # meta_get "<meta>" <key-suffix> [grep -v pattern]
+# meta_int "<meta>" <key-suffix> <default> [grep -v pattern]: a non-negative integer or the default
+meta_int() {
     local out
     out=$(echo "$1" | grep -E "(^|\.)$2=" || true)
-    [[ -n "${3:-}" ]] && out=$(echo "$out" | grep -vE "$3" || true)
-    echo "$out" | head -1 | cut -d= -f2
+    [[ -n "${4:-}" ]] && out=$(echo "$out" | grep -vE "$4" || true)
+    out=$(echo "$out" | head -1 | cut -d= -f2)
+    [[ "$out" =~ ^[0-9]{1,12}$ ]] && echo "$out" || echo "$3"
+}
+
+# meta_word "<meta>" <key>: an identifier ([A-Za-z0-9_.-]) or empty
+meta_word() {
+    local out
+    out=$(echo "$1" | grep -E "^$2=" | head -1 | cut -d= -f2 || true)
+    [[ "$out" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] && echo "$out" || echo ""
+}
+
+# meta_num "<meta>" <key> <default>: a decimal number or the default
+meta_num() {
+    local out
+    out=$(echo "$1" | grep -E "^$2=" | head -1 | cut -d= -f2 || true)
+    [[ "$out" =~ ^[0-9]{1,9}(\.[0-9]{1,4})?$ ]] && echo "$out" || echo "$3"
+}
+
+# int_env <name> <value>: dies unless the override is a non-negative integer
+int_env() {
+    [[ -z "$2" || "$2" =~ ^[0-9]{1,9}$ ]] || die "$1 must be a non-negative integer, got: $2"
 }
 
 # ── MTP drafter shipped as a separate GGUF (Gemma 4 QAT) ────────────────────────
@@ -177,9 +253,9 @@ find_mtp_draft() {
     for cand in "${cands[@]}"; do
         [[ -f "$cand" && ! "$cand" -ef "$target" ]] || continue
         meta=$(parse_gguf "$cand" 2>/dev/null) || continue
-        d_arch=$(meta_get "$meta" general.architecture)
-        d_layers=$(meta_get "$meta" nextn_predict_layers vision)
-        if [[ "$d_arch" == "${arch}-assistant" && "${d_layers:-0}" -gt 0 ]]; then
+        d_arch=$(meta_word "$meta" general.architecture)
+        d_layers=$(meta_int "$meta" nextn_predict_layers 0 vision)
+        if [[ "$d_arch" == "${arch}-assistant" ]] && (( d_layers > 0 )); then
             echo "$cand"
             return 0
         fi
@@ -188,32 +264,47 @@ find_mtp_draft() {
     return 0
 }
 
+is_drafter_arch() {  # drafters are not run on their own
+    [[ "$1" == *-assistant || "$1" == dflash* || "$1" == eagle* ]]
+}
+
 # ── -ncmoe estimate ─────────────────────────────────────────────────────────────
-# Each MoE layer kept on the GPU costs n_experts × 3 matrices × embed × expert_ff × ~4.5 bits.
-# 56 % of free VRAM goes to experts, the rest to attention, KV cache and compute buffers.
-# Calibrated so that an idle RTX 3060 Ti 8 GB (~7.8 GB free) gives 30 for Qwen3.6-35B-A3B Q4_K_M,
-# which loaded with every build tested (29 also did with some). Other cards and models: sweep around it.
+# Args: n_layers expert_layer_mb free_vram_mb
+# expert_layer_mb is the size of one layer's experts, read from the tensor table of the GGUF
+# (largest layer, so mixed quantisations are covered). 66 % of free VRAM goes to experts, the
+# rest to attention, KV cache and compute buffers. Calibrated so that an idle RTX 3060 Ti 8 GB
+# (~7.8 GB free) gives 30 for Qwen3.6-35B-A3B UD-Q4_K_M (498 MB per layer), which loaded with
+# every build tested (29 also did with some). Other cards and models: sweep around it.
 compute_ncmoe() {
-    python3 - "$@" <<'PYEOF'
+    python3 -I - "$@" <<'PYEOF'
 import math, sys
-n_layers, n_experts, embed, expert_ff, vram_mb = map(float, sys.argv[1:6])
-per_expert_gb = 3 * embed * expert_ff * (4.5 / 8) / 1024**3
-budget_gb = vram_mb / 1024 * 0.56
-gpu_layers = math.floor(budget_gb / (n_experts * per_expert_gb)) if per_expert_gb > 0 and budget_gb > 0 else 0
+n_layers, layer_mb, vram_mb = map(float, sys.argv[1:4])
+budget_mb = vram_mb * 0.66
+gpu_layers = math.floor(budget_mb / layer_mb) if layer_mb > 0 and budget_mb > 0 else 0
 print(max(0, int(n_layers) - gpu_layers))
+PYEOF
+}
+
+# Fallback when the tensor table has no per-layer experts: n_experts × 3 matrices × embed × expert_ff
+# at the file's average bits per weight.
+estimate_expert_layer_mb() {
+    python3 -I - "$@" <<'PYEOF'
+import sys
+n_experts, embed, expert_ff, bpw = map(float, sys.argv[1:5])
+print(round(n_experts * 3 * embed * expert_ff * bpw / 8 / 2**20))
 PYEOF
 }
 
 # ── Tensor split for dual mode ──────────────────────────────────────────────────
 # Prints "<igpu>/<dgpu>" or "none" if the model does not fit on both.
 compute_dual_ts() {
-    python3 - "$@" <<'PYEOF'
+    python3 -I - "$@" <<'PYEOF'
 import math, sys
 file_gb, dgpu_free_mb, igpu_free_mb = map(float, sys.argv[1:4])
 is_moe = sys.argv[4] == "1"
 dgpu_gb = dgpu_free_mb * 0.85 / 1024
 igpu_gb = igpu_free_mb * 0.90 / 1024
-if dgpu_gb + igpu_gb < file_gb:
+if file_gb <= 0 or dgpu_gb + igpu_gb < file_gb:
     print("none"); sys.exit()
 d = min(dgpu_gb / file_gb, 0.25 if is_moe else 0.45)
 i_int, d_int = round((1 - d) * 20), max(1, round(d * 20))
@@ -225,7 +316,7 @@ PYEOF
 # ── Context size that fits ──────────────────────────────────────────────────────
 # Args: n_layers n_kv_heads embed head_count capacity_mb file_gb ctk cap
 compute_ctx() {
-    python3 - "$@" <<'PYEOF'
+    python3 -I - "$@" <<'PYEOF'
 import sys
 n_layers, n_kv, embed, heads, cap_mb, file_gb = map(float, sys.argv[1:7])
 ctk, ceiling = sys.argv[7], int(sys.argv[8])
@@ -240,33 +331,44 @@ PYEOF
 }
 
 # ── Decide everything ───────────────────────────────────────────────────────────
-# Prints shell assignments for eval. Fails if the model cannot be parsed.
+# Prints shell assignments (scalars and two argument arrays) for eval, every value
+# quoted with printf %q. Prints its own error and returns 1 on failure.
 select_config() {
     local model="$1" meta
     meta=$(parse_gguf "$model") || return 1
 
-    local arch file_gb n_experts n_layers embed expert_ff n_nextn n_kv heads ctx_train
-    arch=$(meta_get "$meta" general.architecture)
-    file_gb=$(meta_get "$meta" file_size_gb); file_gb=${file_gb:-0}
-    n_experts=$(meta_get "$meta" expert_count 'used|shared|feed'); n_experts=${n_experts:-0}
-    n_layers=$(meta_get "$meta" block_count vision); n_layers=${n_layers:-32}
-    embed=$(meta_get "$meta" embedding_length vision); embed=${embed:-4096}
-    expert_ff=$(meta_get "$meta" expert_feed_forward_length shared); expert_ff=${expert_ff:-0}
-    n_nextn=$(meta_get "$meta" nextn_predict_layers vision); n_nextn=${n_nextn:-0}
-    n_kv=$(meta_get "$meta" head_count_kv); n_kv=${n_kv:-0}
-    heads=$(meta_get "$meta" head_count '_kv'); heads=${heads:-32}
-    ctx_train=$(meta_get "$meta" context_length vision); ctx_train=${ctx_train:-131072}
+    int_env AI_NCMOE "${AI_NCMOE:-}"; int_env AI_CTX "${AI_CTX:-}"; int_env AI_UB "${AI_UB:-}"
+    int_env AI_MTP_N "${AI_MTP_N:-}"; int_env AI_PORT "${AI_PORT:-}"
+
+    local arch file_gb n_experts n_layers embed expert_ff n_nextn n_kv heads ctx_train layer_mb bpw
+    arch=$(meta_word "$meta" general.architecture)
+    file_gb=$(meta_num "$meta" file_size_gb 0)
+    n_experts=$(meta_int "$meta" expert_count 0)
+    n_layers=$(meta_int "$meta" block_count 32 vision)
+    embed=$(meta_int "$meta" embedding_length 4096 vision)
+    expert_ff=$(meta_int "$meta" expert_feed_forward_length 0 shared)
+    n_nextn=$(meta_int "$meta" nextn_predict_layers 0 vision)
+    n_kv=$(meta_int "$meta" head_count_kv 0)
+    heads=$(meta_int "$meta" head_count 32)
+    ctx_train=$(meta_int "$meta" context_length 131072 vision)
+    layer_mb=$(meta_int "$meta" expert_layer_mb 0)
+    bpw=$(meta_num "$meta" bits_per_weight 4.5)
+    (( ctx_train > 0 )) || ctx_train=131072
+    (( heads > 0 )) || heads=32
 
     local is_moe=false; (( n_experts > 0 )) && is_moe=true
+    local is_drafter=false; is_drafter_arch "$arch" && is_drafter=true
 
     # MTP: head inside the GGUF, or a separate drafter file
     local mtp_draft="" is_mtp=false mtp_external=false
-    mtp_draft=$(find_mtp_draft "$model" "$arch")
-    if [[ -n "$mtp_draft" ]]; then
-        is_mtp=true; mtp_external=true
-        n_nextn=$(meta_get "$(parse_gguf "$mtp_draft")" nextn_predict_layers vision)
-    elif (( n_nextn > 0 )); then
-        is_mtp=true
+    if ! $is_drafter; then
+        mtp_draft=$(find_mtp_draft "$model" "$arch")
+        if [[ -n "$mtp_draft" ]]; then
+            is_mtp=true; mtp_external=true
+            n_nextn=$(meta_int "$(parse_gguf "$mtp_draft")" nextn_predict_layers 1 vision)
+        elif (( n_nextn > 0 )); then
+            is_mtp=true
+        fi
     fi
 
     # Vision projector: only auto-detected when the model sits in its own folder
@@ -287,17 +389,21 @@ select_config() {
         fi
     fi
     if [[ -n "$mmproj" ]]; then
-        [[ -f "$mmproj" ]] || die "AI_MMPROJ not found: $mmproj"
+        [[ -f "$mmproj" ]] || { echo -e "  ${RED}✗${NC} AI_MMPROJ not found: $mmproj" >&2; return 1; }
         mmproj_gb=$(stat -L -c%s "$mmproj" | awk '{printf "%.2f", $1/1024^3}')
     fi
 
-    # Device
+    # Device. A dense model goes to the dGPU when it fits with ~0.5 GB to spare
+    # (7.5 GB on an 8 GB card), else to both GPUs.
     local gpu="${AI_GPU:-}"
     [[ "$gpu" == "rtx" ]] && gpu="dgpu"
+    case "$gpu" in ""|dgpu|igpu|dual) ;; *) echo -e "  ${RED}✗${NC} AI_GPU must be dgpu, igpu or dual" >&2; return 1 ;; esac
     if [[ -z "$gpu" ]]; then
         if dgpu_available; then
-            if ! $is_moe && gt "$file_gb" 7.5; then
-                if igpu_available; then gpu="dual"; else gpu="dgpu"; warn "dense model ${file_gb} GB is larger than 7.5 GB"; fi
+            local dense_limit_gb
+            dense_limit_gb=$(dgpu_total_mb | awk '{printf "%.2f", $1/1024 - 0.5}')
+            if ! $is_moe && gt "$file_gb" "${dense_limit_gb:-7.5}"; then
+                if igpu_available; then gpu="dual"; else gpu="dgpu"; warn "dense model ${file_gb} GB is larger than ${dense_limit_gb} GB"; fi
             else
                 gpu="dgpu"
             fi
@@ -309,6 +415,7 @@ select_config() {
 
     # Split / -ncmoe
     local ncmoe=0 ts="${AI_TS:-}"
+    [[ -z "$ts" || "$ts" =~ ^[0-9]{1,3}/[0-9]{1,3}$ ]] || { echo -e "  ${RED}✗${NC} AI_TS must look like 3/2" >&2; return 1; }
     if [[ "$gpu" == "dual" ]]; then
         if [[ -z "$ts" ]]; then
             ts=$(compute_dual_ts "$file_gb" "$(dgpu_free_mb)" "$(igpu_capacity_mb)" "$($is_moe && echo 1 || echo 0)")
@@ -317,75 +424,61 @@ select_config() {
             warn "model ${file_gb} GB does not fit on both GPUs, using the iGPU"
             gpu="igpu"; ts=""
         fi
-    elif [[ "$gpu" == "dgpu" ]] && $is_moe && (( expert_ff > 0 )); then
+    elif [[ "$gpu" == "dgpu" ]] && $is_moe; then
         if [[ -n "${AI_NCMOE:-}" ]]; then
             ncmoe="$AI_NCMOE"
         else
             local vram; vram=$(dgpu_free_mb)
-            vram=$(python3 -c "import sys; print(max(0, float(sys.argv[1]) - float(sys.argv[2]) * 1024))" "${vram:-0}" "$mmproj_gb")
+            [[ "$vram" =~ ^[0-9]+$ ]] || vram=0
+            vram=$(python3 -I -c "import sys; print(int(max(0, float(sys.argv[1]) - float(sys.argv[2]) * 1024)))" "$vram" "$mmproj_gb")
             # block_count includes the MTP layer(s) when the head is inside the GGUF
             local main_layers=$n_layers
-            $is_mtp && ! $mtp_external && main_layers=$(( n_layers - n_nextn ))
-            ncmoe=$(compute_ncmoe "$main_layers" "$n_experts" "$embed" "$expert_ff" "$vram")
-            # The MTP head and its draft context need ~500 MB more. Measured on Qwen3.6-35B-A3B:
-            # best MTP point at 33 versus 30 without MTP. A separate drafter does not count here.
-            if $is_mtp && ! $mtp_external; then
-                ncmoe=$(( ncmoe + 3 > main_layers ? main_layers : ncmoe + 3 ))
+            $is_mtp && ! $mtp_external && main_layers=$(( n_layers > n_nextn ? n_layers - n_nextn : n_layers ))
+            (( layer_mb > 0 )) || layer_mb=$(estimate_expert_layer_mb "$n_experts" "$embed" "$expert_ff" "$bpw")
+            if (( layer_mb > 0 )); then
+                ncmoe=$(compute_ncmoe "$main_layers" "$layer_mb" "$vram")
+                # The MTP head and its draft context need more VRAM. Measured on Qwen3.6-35B-A3B:
+                # best MTP point at 33 versus 30 without MTP. A separate drafter does not count here.
+                if $is_mtp && ! $mtp_external; then
+                    ncmoe=$(( ncmoe + 3 > main_layers ? main_layers : ncmoe + 3 ))
+                fi
             fi
         fi
     fi
 
-    # Backend for the dGPU: CUDA is faster for MoE offload and MTP (45.6 vs 33.8 t/s tg on
-    # Qwen3.6-35B-A3B, 2026-10); Vulkan was faster for a small dense model (2026-05).
+    # Backend for the dGPU: CUDA was faster for MoE offload and MTP (45.6 against 33.8 t/s on
+    # Qwen3.6-35B-A3B, 2026-10). Dense models stay on Vulkan by default, which ran Qwen3-8B at
+    # 64.3 t/s in 2026-05; llama.cpp CUDA was not measured on a dense model fully in VRAM.
     local backend="vulkan"
     if [[ "$gpu" == "dgpu" ]]; then
         case "${AI_BACKEND:-auto}" in
             cuda) backend="cuda" ;;
             vulkan) backend="vulkan" ;;
-            *) if [[ -x "$CUDA_BIN/llama-server" ]] && { $is_moe || $is_mtp; }; then backend="cuda"; fi ;;
+            auto) if [[ -x "$CUDA_BIN/llama-server" ]] && { $is_moe || $is_mtp; }; then backend="cuda"; fi ;;
+            *) echo -e "  ${RED}✗${NC} AI_BACKEND must be auto, cuda or vulkan" >&2; return 1 ;;
         esac
-        [[ "$backend" == "cuda" && ! -x "$CUDA_BIN/llama-server" ]] && die "AI_BACKEND=cuda but $CUDA_BIN/llama-server is missing"
+        if [[ "$backend" == "cuda" && ! -x "$CUDA_BIN/llama-server" ]]; then
+            echo -e "  ${RED}✗${NC} AI_BACKEND=cuda but $CUDA_BIN/llama-server is missing" >&2; return 1
+        fi
     fi
     local bin="$VK_BIN"; [[ "$backend" == "cuda" ]] && bin="$CUDA_BIN"
 
     # KV cache: q8_0 K everywhere (same speed as f16, half the memory).
-    # q8_0 V on the iGPU for models over 10 GB (memory bandwidth bound): 9.9 -> 19.0 t/s on Gemma 4 26B.
+    # q8_0 V on the iGPU for models over 10 GB (memory bandwidth bound). On Gemma 4 26B, q8_0 V
+    # together with dropping nogttspill took the 780M from 9.9 to 19.0 t/s.
     local ctk="${AI_CTK:-q8_0}" ctv="${AI_CTV:-}"
     if [[ -z "$ctv" ]]; then
         if [[ "$gpu" == "igpu" ]] && gt "$file_gb" 10; then ctv="q8_0"; else ctv="f16"; fi
     fi
     local ub="${AI_UB:-}"; [[ -z "$ub" ]] && { [[ "$gpu" == "igpu" ]] && ub=1024 || ub=512; }
 
-    # Device flags (llama-bench separates devices with "/", llama-server with ",")
-    local bench_dev="" server_dev="" env_prefix=""
-    case "$gpu" in
-        dual) bench_dev="-dev $VK_IGPU/$VK_DGPU -ts $ts"; server_dev="-dev $VK_IGPU,$VK_DGPU -ts $ts" ;;
-        dgpu) [[ "$backend" == "vulkan" ]] && { bench_dev="-dev $VK_DGPU"; server_dev="-dev $VK_DGPU"; } ;;
-        igpu) bench_dev="-dev $VK_IGPU"; server_dev="-dev $VK_IGPU" ;;
-    esac
     # nogttspill keeps RADV allocations in the UMA carve-out. It helps only when the model
     # plus KV fits there; with a larger model it forces a slow overflow (28.0 -> 20.5 t/s).
+    local env_prefix=""
     if [[ "$gpu" != "dgpu" ]]; then
         local uma; uma=$(igpu_uma_mb)
-        if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) * 1.25 * 1024 < float(sys.argv[2]) else 1)" "$file_gb" "${uma:-0}"; then
+        if python3 -I -c "import sys; sys.exit(0 if float(sys.argv[1]) * 1.25 * 1024 < float(sys.argv[2] or 0) else 1)" "$file_gb" "${uma:-0}"; then
             env_prefix="RADV_PERFTEST=nogttspill"
-        fi
-    fi
-
-    # MTP flags. -np 1: parallel slots with MTP were reported unreliable.
-    local mtp_flags=""
-    if $is_mtp; then
-        mtp_flags="--spec-type draft-mtp --spec-draft-n-max ${AI_MTP_N:-2} -np 1"
-        if $mtp_external; then
-            mtp_flags="$mtp_flags -md $mtp_draft -ngld ${n_nextn:-1}"
-            if [[ "$backend" == "cuda" ]]; then
-                mtp_flags="$mtp_flags -devd CUDA0"
-                [[ "$arch" == "gemma4" ]] && mtp_flags="$mtp_flags -otd token_embd.weight=CUDA0"
-            elif [[ "$gpu" == "dgpu" ]]; then
-                mtp_flags="$mtp_flags -devd $VK_DGPU"
-            else
-                mtp_flags="$mtp_flags -devd $VK_IGPU"
-            fi
         fi
     fi
 
@@ -395,7 +488,8 @@ select_config() {
         if $is_moe; then
             ctx=8192
         elif [[ "$gpu" == "dgpu" ]]; then
-            ctx=$(compute_ctx "$n_layers" "$n_kv" "$embed" "$heads" "$(dgpu_total_mb || echo 8192)" "$file_gb" "$ctk" 131072)
+            local total; total=$(dgpu_total_mb); [[ "$total" =~ ^[0-9]+$ ]] || total=8192
+            ctx=$(compute_ctx "$n_layers" "$n_kv" "$embed" "$heads" "$total" "$file_gb" "$ctk" 131072)
         elif [[ "$gpu" == "igpu" ]]; then
             ctx=$(compute_ctx "$n_layers" "$n_kv" "$embed" "$heads" "$(( $(igpu_uma_mb) + $(ram_budget_for_igpu_mb) ))" "$file_gb" "$ctk" 32768)
         else
@@ -404,25 +498,46 @@ select_config() {
         (( ctx > ctx_train )) && ctx=$ctx_train
     fi
 
-    local common="-ngl 99 -fa on -ctk $ctk -ctv $ctv -ub $ub"
-    (( ncmoe > 0 )) && common="$common -ncmoe $ncmoe"
-    local server_flags="$common${server_dev:+ $server_dev} -c $ctx"
-    [[ -n "$mtp_flags" ]] && server_flags="$server_flags $mtp_flags"
-    [[ -n "$mmproj" ]] && server_flags="$server_flags --mmproj $mmproj"
-    local bench_flags="${common/-fa on/-fa 1}${bench_dev:+ $bench_dev}"
+    # Arguments as arrays, so paths with spaces stay one argument.
+    # llama-bench separates devices with "/", llama-server with ",".
+    local common=(-ngl 99 -ctk "$ctk" -ctv "$ctv" -ub "$ub")
+    (( ncmoe > 0 )) && common+=(-ncmoe "$ncmoe")
+    local server_args=("${common[@]}" -fa on) bench_args=("${common[@]}" -fa 1)
+    case "$gpu" in
+        dual) server_args+=(-dev "$VK_IGPU,$VK_DGPU" -ts "$ts"); bench_args+=(-dev "$VK_IGPU/$VK_DGPU" -ts "$ts") ;;
+        dgpu) [[ "$backend" == "vulkan" ]] && { server_args+=(-dev "$VK_DGPU"); bench_args+=(-dev "$VK_DGPU"); } ;;
+        igpu) server_args+=(-dev "$VK_IGPU"); bench_args+=(-dev "$VK_IGPU") ;;
+    esac
+    server_args+=(-c "$ctx")
+    # MTP. -np 1: parallel slots with MTP were reported unreliable.
+    if $is_mtp; then
+        server_args+=(--spec-type draft-mtp --spec-draft-n-max "${AI_MTP_N:-2}" -np 1)
+        if $mtp_external; then
+            server_args+=(-md "$mtp_draft" -ngld "$n_nextn")
+            if [[ "$backend" == "cuda" ]]; then
+                server_args+=(-devd CUDA0)
+                [[ "$arch" == "gemma4" ]] && server_args+=(-otd token_embd.weight=CUDA0)
+            elif [[ "$gpu" == "dgpu" ]]; then
+                server_args+=(-devd "$VK_DGPU")
+            else
+                server_args+=(-devd "$VK_IGPU")
+            fi
+        fi
+    fi
+    [[ -n "$mmproj" ]] && server_args+=(--mmproj "$mmproj")
 
-    printf 'ARCH=%q\nFILE_GB=%q\nIS_MOE=%q\nN_EXPERTS=%q\nN_LAYERS=%q\nIS_MTP=%q\nN_NEXTN=%q\n' \
-        "$arch" "$file_gb" "$is_moe" "$n_experts" "$n_layers" "$is_mtp" "$n_nextn"
-    printf 'GPU=%q\nBACKEND=%q\nBIN=%q\nNCMOE=%q\nTS=%q\nCTK=%q\nCTV=%q\nUB=%q\nCTX=%q\n' \
-        "$gpu" "$backend" "$bin" "$ncmoe" "$ts" "$ctk" "$ctv" "$ub" "$ctx"
-    printf 'ENV_PREFIX=%q\nMTP_DRAFT=%q\nMMPROJ=%q\nSERVER_FLAGS=%q\nBENCH_FLAGS=%q\n' \
-        "$env_prefix" "$mtp_draft" "$mmproj" "$server_flags" "$bench_flags"
+    printf 'ARCH=%q\nFILE_GB=%q\nIS_MOE=%q\nIS_DRAFTER=%q\nN_EXPERTS=%q\nN_LAYERS=%q\nIS_MTP=%q\nN_NEXTN=%q\n' \
+        "$arch" "$file_gb" "$is_moe" "$is_drafter" "$n_experts" "$n_layers" "$is_mtp" "$n_nextn"
+    printf 'GPU=%q\nBACKEND=%q\nBIN=%q\nNCMOE=%q\nTS=%q\nCTX=%q\nENV_PREFIX=%q\nMTP_DRAFT=%q\nMMPROJ=%q\n' \
+        "$gpu" "$backend" "$bin" "$ncmoe" "$ts" "$ctx" "$env_prefix" "$mtp_draft" "$mmproj"
+    printf 'SERVER_ARGS=('; printf '%q ' "${server_args[@]}"; printf ')\n'
+    printf 'BENCH_ARGS=('; printf '%q ' "${bench_args[@]}"; printf ')\n'
 }
 
 load_config() {
     [[ -f "$1" ]] || die "model not found: $1"
     local cfg
-    cfg=$(select_config "$1") || die "could not read GGUF metadata: $1"
+    cfg=$(select_config "$1") || exit 1   # select_config already printed why
     eval "$cfg"
 }
 
@@ -434,6 +549,11 @@ gpu_label() {
     esac
 }
 
+show_cmd() {  # print a command line with shell quoting
+    local out; out=$(printf '%q ' "$@")
+    echo "  ${ENV_PREFIX:+$ENV_PREFIX }${out% }"
+}
+
 # ── Commands ────────────────────────────────────────────────────────────────────
 cmd_list() {
     echo -e "\n${BOLD}Models in ${AI_MODELS_DIR}${NC}\n"
@@ -441,9 +561,14 @@ cmd_list() {
     printf "  %-46s %8s  %-6s %-6s %-5s %s\n" "FILE" "SIZE" "TYPE" "GPU" "MTP" "-ncmoe"
     while IFS= read -r -d '' f; do
         [[ "$(basename "$f")" == mmproj* || "$(basename "$f")" == mtp-* ]] && continue
-        if ( load_config "$f" 2>/dev/null; printf "  %-46s %6s GB  %-6s %-6s %-5s %s\n" \
-                "$(basename "$f")" "$FILE_GB" "$($IS_MOE && echo MoE || echo dense)" "$GPU" \
-                "$($IS_MTP && echo yes || echo -)" "$( (( NCMOE > 0 )) && echo "$NCMOE" || echo -)" ); then
+        if ( load_config "$f" 2>/dev/null
+             if $IS_DRAFTER; then
+                 printf "  %-46s %6s GB  %-6s %-6s %-5s %s\n" "$(basename "$f")" "$FILE_GB" "draft" "-" "-" "-"
+             else
+                 printf "  %-46s %6s GB  %-6s %-6s %-5s %s\n" "$(basename "$f")" "$FILE_GB" \
+                     "$($IS_MOE && echo MoE || echo dense)" "$GPU" "$($IS_MTP && echo yes || echo -)" \
+                     "$( (( NCMOE > 0 )) && echo "$NCMOE" || echo -)"
+             fi ); then
             n=$(( n + 1 ))
         else
             warn "could not parse $(basename "$f")"
@@ -457,14 +582,19 @@ cmd_info() {
     load_config "$1"
     echo -e "\n${BOLD}ai-auto info: $(basename "$1")${NC}\n"
     ok "architecture : ${ARCH:-unknown}, ${FILE_GB} GB"
+    if $IS_DRAFTER; then
+        warn "this is a drafter for speculative decoding, not a model to run on its own"
+        echo ""
+        return 0
+    fi
     if $IS_MOE; then ok "type         : MoE, ${N_EXPERTS} experts, ${N_LAYERS} layers"; else ok "type         : dense, ${N_LAYERS} layers"; fi
     $IS_MTP && ok "MTP          : ${N_NEXTN} NextN layer(s)${MTP_DRAFT:+, drafter $(basename "$MTP_DRAFT")}"
     [[ -n "$MMPROJ" ]] && ok "vision       : $(basename "$MMPROJ")"
     ok "device       : $(gpu_label)"
     echo -e "\n${BOLD}llama-server${NC}"
-    echo "  ${ENV_PREFIX:+$ENV_PREFIX }$BIN/llama-server -m $1 $SERVER_FLAGS --host ${AI_HOST:-127.0.0.1} --port ${AI_PORT:-8080}"
+    show_cmd "$BIN/llama-server" -m "$1" "${SERVER_ARGS[@]}" --host "${AI_HOST:-127.0.0.1}" --port "${AI_PORT:-8080}"
     echo -e "\n${BOLD}llama-bench${NC} (no speculative decoding: use bin/serve-bench for MTP)"
-    echo "  ${ENV_PREFIX:+$ENV_PREFIX }$BIN/llama-bench -m $1 $BENCH_FLAGS -p 512 -n 200 -r 3"
+    show_cmd "$BIN/llama-bench" -m "$1" "${BENCH_ARGS[@]}" -p 512 -n 200 -r 3
     if [[ "$GPU" == "dgpu" ]] && $IS_MOE; then
         echo ""
         warn "-ncmoe ${NCMOE} comes from the free VRAM right now ($(dgpu_free_mb) MB). Sweep it: AI_NCMOE=<n>."
@@ -476,21 +606,21 @@ cmd_info() {
 cmd_serve() {
     local model="$1"; shift
     load_config "$model"
+    $IS_DRAFTER && die "$(basename "$model") is a drafter, not a model to serve on its own"
     local mtp=""; $IS_MTP && mtp=", MTP"
     info "$(basename "$model") on $(gpu_label), -ncmoe ${NCMOE}, ctx ${CTX}${mtp}"
     [[ -n "$ENV_PREFIX" ]] && export "${ENV_PREFIX?}"
-    # shellcheck disable=SC2086
-    exec "$BIN/llama-server" -m "$model" $SERVER_FLAGS --host "${AI_HOST:-127.0.0.1}" --port "${AI_PORT:-8080}" "$@"
+    exec "$BIN/llama-server" -m "$model" "${SERVER_ARGS[@]}" --host "${AI_HOST:-127.0.0.1}" --port "${AI_PORT:-8080}" "$@"
 }
 
 cmd_bench() {
     local model="$1"
     load_config "$model"
+    $IS_DRAFTER && die "$(basename "$model") is a drafter, not a model to benchmark on its own"
     info "$(basename "$model") on $(gpu_label), -ncmoe ${NCMOE}"
     $IS_MTP && warn "llama-bench ignores MTP; this measures the model without it"
     [[ -n "$ENV_PREFIX" ]] && export "${ENV_PREFIX?}"
-    # shellcheck disable=SC2086
-    exec "$BIN/llama-bench" -m "$model" $BENCH_FLAGS -p 512 -n 200 -r 3
+    exec "$BIN/llama-bench" -m "$model" "${BENCH_ARGS[@]}" -p 512 -n 200 -r 3
 }
 
 usage() {
